@@ -2,11 +2,25 @@ package main
 
 import (
 	"fmt"
+	"log"
 	"net"
 	"os"
+	"os/signal"
 	"strconv"
 	"time"
 )
+
+const MulticastAddr = "239.239.239.239"
+
+const BuffSize = 16384
+
+type UserConfig struct {
+	HdwInterface *net.Interface
+	IPAddr       string
+	Port         string
+}
+
+var Config UserConfig
 
 func main() {
 	if len(os.Args) != 4 {
@@ -26,50 +40,69 @@ func main() {
 		os.Exit(1)
 	}
 
-	ifaceIdx, _ := strconv.Atoi(os.Args[1])
+	interruptChan := make(chan os.Signal, 1)
+	signal.Notify(interruptChan, os.Interrupt)
 
-	// Resolve the UDP address for the multicast group
-	udpAddr, err := net.ResolveUDPAddr("udp", "239.239.239.239:"+os.Args[3])
+	ArgHdwIdx, _ := strconv.Atoi(os.Args[1])
+	Config.Port = os.Args[3]
+	Config.IPAddr = os.Args[2]
+
+	var ifaceerr error
+	Config.HdwInterface, ifaceerr = net.InterfaceByIndex(ArgHdwIdx)
+	if ifaceerr != nil {
+		fmt.Println(ifaceerr)
+		os.Exit(1)
+	}
+
+	udpAddr, err := net.ResolveUDPAddr("udp", MulticastAddr+":"+Config.Port)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 
-	// Get the network interface by index
-	iface, err := net.InterfaceByIndex(ifaceIdx) // Replace 6 with the actual index of your interface
-	fmt.Printf("Using Interface: %s\n", iface.Name)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	// Create a UDP connection to listen on the specified port
-	conn, err := net.ListenMulticastUDP("udp", iface, udpAddr)
+	log.Printf("Using interface %s", Config.HdwInterface.Name)
+	conn, err := net.ListenMulticastUDP("udp", Config.HdwInterface, udpAddr)
 	if err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
 	defer conn.Close()
 
-	fmt.Printf("Listening to:%s:%s on %s\n", os.Args[2], os.Args[3], udpAddr.String())
+	fmt.Printf("Listening to:\t%s:%s on %s\n", Config.IPAddr, Config.Port, udpAddr.String())
 
-	// Buffer to hold incoming data
-	buf := make([]byte, 1024)
+	packetChan := make(chan *net.UDPAddr)
+
+	// Start the listener in a goroutine
+	go listenForPackets(conn, packetChan)
 
 	for {
-		// Read from the connection
+		select {
+		case <-interruptChan:
+			fmt.Println("\nReceived Ctrl+C, closing connection...")
+			return
+		case <-packetChan:
+			continue
+		}
+	}
+}
+
+func listenForPackets(conn *net.UDPConn, packetChan chan<- *net.UDPAddr) {
+	buf := make([]byte, BuffSize)
+	for {
 		n, addr, err := conn.ReadFromUDP(buf)
 		if err != nil {
+			if opErr, ok := err.(*net.OpError); ok && opErr.Err.Error() == "use of closed network connection" {
+				return
+			}
 			fmt.Println(err)
 			continue
 		}
 
-		// Check if the packet is from the desired source address
-		if addr.IP.String() == os.Args[2] {
-			// Print the data read from the connection to the terminal
+		if addr.IP.String() == Config.IPAddr {
 			now := time.Now()
 			formattedTime := now.Format("15:04:05")
 			fmt.Printf("%s: %s\n", formattedTime, string(buf[:n]))
+			packetChan <- addr
 		}
 	}
 }
